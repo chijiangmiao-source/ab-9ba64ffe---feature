@@ -34,8 +34,8 @@
 app/engine.py    精确区域复核引擎（模型解析、校验、区域传播、见证）
 app/storage.py   审计标识证据留存（规范化指纹、重放、冲突）
 app/main.py      FastAPI：/api/reviews、/api/reviews/{id}、/health、页面
-app/static/      复核页面（结论 + 逐事件区域证据）
-tests/           31 项规则/API/差分不变量测试
+app/static/      复核页面（结论 + 逐事件区域证据 + 时钟来源重开）
+tests/           规则/API/差分不变量/时钟来源测试
 verify/          verify 容器入口脚本与 HTTP 冒烟
 Dockerfile, docker-compose.yml
 ```
@@ -65,7 +65,9 @@ docker compose up --build --exit-code-from verify verify
 ```
 
 冒烟覆盖：合法重叠抖动时窗冻结、冷却区间缺口（见证 `9/2`、阻断守卫）、
-非法重叠模型（422）、语义等价重传回放、同标识改内容冲突（409 且原证据保留）。
+非法重叠模型（422）、语义等价重传回放、同标识改内容冲突（409 且原证据保留）、
+重开裁决时按最后复位划分的不重叠来源组（分叉复位/未复位路径稳定分组）及各类
+查询拒绝（原结论保持可读）。
 
 ## 本地运行（无 Docker）
 
@@ -127,3 +129,34 @@ verify/run_tests.sh                      # 与 verify 容器相同的三步流�
 - 语义等价重传在原结论中附 `replay.semantically_equivalent_retransmission=true`。
 
 `GET /api/reviews/{audit_id}` 取回留存的原始结论与证据。
+
+### 重开裁决 · 时钟来源（复位溯源）
+
+复核员重新打开一份**已冻结或已拒绝**的捕获后，在详情页选定一个**时钟**与
+一个**已处理事件**，调用只读接口：
+
+`GET /api/reviews/{audit_id}/origins?clock=y&event=0`
+
+接口以同一条精确区域传播（区域切分 → 唯一迁移 → 复位）**重放**证据，并按该
+时钟**最后一次复位的事件与迁移**把仍可行区域划分为**两两不重叠**的来源组。
+每组返回：
+
+- `origin`：`initial`（自初始时刻继承、全程未复位）或 `reset`（具体迁移复位）；
+- `reset_event_index` / `reset_event` / `reset_transition`：复位所在事件与迁移；
+- `witness_before` / `witness_after`：复位（或所选事件）前后的**可代入有理数
+  时钟见证**；
+- `feasible_region_count`：该来源覆盖的仍可行区域数量（附每区域的进入守卫单元、
+  触发轨迹、区域差分约束与可代入取值）。
+
+**相同展示值绝不合并**：在被拒绝事件处窗口可同时与多个互斥守卫盒相交，两个
+迁移即便都把时钟复位为 0，仍分别成组；一条分支复位、另一条分支未复位时，则
+同时保留 `reset` 与 `initial` 两组。`entry_cells_pairwise_disjoint` 用 DBM
+可行性逐对核验来源组不重叠。该只读查询**不改动**原冻结/拒绝结论。
+
+查询会被**明确拒绝**（`status:"origin_query_refused"`，原结论保留且仍可读）：
+
+- `unknown_clock`：选择了模型未声明的时钟（422）；
+- `event_not_processed`：事件下标缺失/非整数/不在捕获范围（422/400）；
+- `event_beyond_first_failure`：越过被拒绝裁决的首个失败事件（422）；
+- `no_traceable_regions`：记录为非法模型，或历史记录缺少原始载荷/可追溯区域
+  证据（422）。

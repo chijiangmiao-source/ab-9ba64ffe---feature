@@ -891,3 +891,308 @@ def _reason_text(f: dict[str, Any]) -> str:
         return ("after the final event a possible trajectory rests in "
                 f"non-final location {f.get('location')!r}")
     return f"event[{idx}]: review failed"
+
+# ---- clock-origin (reset provenance) replay ---------------------------------
+#
+# When a reviewer reopens a frozen/rejected capture and picks a clock plus a
+# processed event, the question is: across the *still feasible* regions at
+# that event, does the clock's value descend from the initial instant (never
+# reset) or from a concrete transition reset on this trajectory?
+#
+# Equal displayed values are never merged into one cooling source: provenance
+# advances together with region splitting, transition firing and resetting, so
+# the same clock on two feasible trajectories whose last resets differ stays in
+# two non-overlapping origin groups.  The split cells themselves (post-elapse
+# zone intersected with the guard boxes) are mutually exclusive -- closed
+# guard boxes were validated disjoint -- even though the post-reset projected
+# zones can coincide when both branches reset the queried clock to 0.
+
+ORIGIN_INITIAL = "initial"
+ORIGIN_RESET = "reset"
+
+
+class OriginQueryError(ValueError):
+    """A clock-origin reopen query is not admissible."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass
+class _OriginRegion:
+    location: int            # location after the last processed event
+    zone: Zone               # feasible zone after the last processed event
+    # ("initial",) or
+    # ("reset", event_index, event_name, transition_id, pre_reset_value)
+    origin: tuple
+    trace: tuple[tuple, ...]
+    # evidence at the last processed event:
+    pre_location: int = -1
+    entry_zone: "Zone | None" = None   # post-elapse guard cell actually taken
+    pre_event_value: dict[str, Any] | None = None
+
+
+def _clock_sample(zone: Zone, model: Model, clock_index: int
+                  ) -> dict[str, Any]:
+    return zone.assignment(model.clocks)[model.clocks[clock_index]]
+
+
+def clock_origins(model: Model, events: list[EventWindow],
+                 event_index: int, clock_index: int) -> dict[str, Any]:
+    """Replay the capture with per-region reset provenance for one clock.
+
+    Returns the feasible regions after ``event_index`` partitioned by the
+    clock's last-reset origin.  Every mutually exclusive feasible guard cell
+    is kept separately -- notably the several cells that coexist at a
+    coverage-gap failure, which may reset different clock sets.  Regions merge
+    only when location, zone, history trace and provenance coincide, never on
+    the displayed clock value.
+    """
+    n = model.n
+    regions: list[_OriginRegion] = [
+        _OriginRegion(model.initial, Zone.initial(n),
+                      (ORIGIN_INITIAL,), ())]
+
+    for w in events[:event_index + 1]:
+        idx = w.raw_index
+        advanced: list[tuple[_OriginRegion, Zone]] = []
+        for r in regions:
+            az = r.zone.restrict_elapse_window(w.lo, w.hi)
+            if az.is_satisfiable():
+                advanced.append((r, az))
+
+        by_loc: dict[int, list[Transition]] = {}
+        for t in model.transitions:
+            if t.event == w.event:
+                by_loc.setdefault(t.source, []).append(t)
+
+        children: list[_OriginRegion] = []
+        for r, az in advanced:
+            candidates = by_loc.get(r.location, [])
+            feasible: list[tuple[Transition, Zone]] = []
+            for t in candidates:
+                gz = az.intersect(t.guard_zone(n))
+                gz.canonicalize()
+                if gz.is_satisfiable():
+                    feasible.append((t, gz))
+
+            # uncovered_time / no_transition: gap points fire no transition
+            # and therefore produce no traceable continuation; their rational
+            # witness stays in the stored rejection.  The *feasible* guard
+            # cells below remain the still-feasible regions and are traced
+            # separately (they may reset the clock on different branches).
+            for t, gz in feasible:
+                pre_value = _clock_sample(gz, model, clock_index)
+                post = gz.reset(c + 1 for c in t.resets)
+                post.canonicalize()
+                if clock_index in t.resets:
+                    origin = (ORIGIN_RESET, idx, w.event, t.id, pre_value)
+                else:
+                    origin = r.origin
+                reset_names = tuple(model.clocks[c]
+                                    for c in sorted(t.resets))
+                children.append(_OriginRegion(
+                    t.target, post, origin,
+                    r.trace + ((idx, w.event, t.id, reset_names),),
+                    pre_location=r.location, entry_zone=gz,
+                    pre_event_value=pre_value))
+
+        merged: dict[tuple, _OriginRegion] = {}
+        for c in children:
+            key = (c.location, c.zone.signature(),
+                   _origin_key(c.origin), c.trace)
+            if key not in merged:
+                merged[key] = c
+        regions = list(merged.values())
+
+    return _render_origins(model, events, event_index, clock_index, regions)
+
+
+def _origin_key(origin: tuple) -> tuple:
+    if origin[0] == ORIGIN_INITIAL:
+        return (ORIGIN_INITIAL,)
+    # distinct last-reset event/transition always stays a separate source
+    return (ORIGIN_RESET, origin[1], origin[3])
+
+
+def _origin_sort_key(origin: tuple) -> tuple:
+    if origin[0] == ORIGIN_INITIAL:
+        return (0,)
+    return (1, origin[1], origin[3])
+
+
+def _trace_sort_key(trace: tuple[tuple, ...]) -> tuple:
+    return tuple((step[0], step[2] or "~") for step in trace)
+
+
+def _render_origins(model: Model, events: list[EventWindow],
+                    event_index: int, clock_index: int,
+                    regions: list[_OriginRegion]) -> dict[str, Any]:
+    groups: dict[tuple, list[_OriginRegion]] = {}
+    representatives: dict[tuple, tuple] = {}
+    for r in regions:
+        key = _origin_key(r.origin)
+        groups.setdefault(key, []).append(r)
+        representatives.setdefault(key, r.origin)
+
+    summaries: list[dict[str, Any]] = []
+    for key in sorted(groups,
+                      key=lambda k: _origin_sort_key(representatives[k])):
+        members = sorted(groups[key],
+                         key=lambda r: (r.pre_location, r.location,
+                                        _trace_sort_key(r.trace),
+                                        str(r.zone.signature())))
+        origin = representatives[key]
+        if origin[0] == ORIGIN_INITIAL:
+            # Never reset: one substitutable rational value straddles the
+            # selected event -- the clock is inherited through the actual
+            # transition with an unchanged value, rather than refreshed by a
+            # cooling reset.  Equal displayed values elsewhere still do not
+            # merge sources; grouping follows the reset history, not values.
+            first = members[0]
+            v = first.pre_event_value or frac_out(Fraction(0))
+            summary = {
+                "origin": ORIGIN_INITIAL,
+                "reset_event_index": None,
+                "reset_event": None,
+                "reset_transition": None,
+                "witness_event_index": event_index,
+                "witness_before": {"point": "before_event",
+                                   "event_index": event_index,
+                                   "clock_value": v},
+                "witness_after": {"point": "after_event",
+                                  "event_index": event_index,
+                                  "clock_value": v},
+            }
+        else:
+            _, ev_idx, ev_name, tid, before = origin
+            summary = {
+                "origin": ORIGIN_RESET,
+                "reset_event_index": ev_idx,
+                "reset_event": ev_name,
+                "reset_transition": tid,
+                "witness_event_index": ev_idx,
+                "witness_before": {"point": "before_reset",
+                                   "event_index": ev_idx,
+                                   "clock_value": before},
+                "witness_after": {"point": "after_reset",
+                                  "event_index": ev_idx,
+                                  "clock_value": frac_out(Fraction(0))},
+            }
+        summary["feasible_region_count"] = len(members)
+        summary["regions"] = [
+            _render_origin_region(model, r) for r in members]
+        summaries.append(summary)
+
+    return {
+        "status": "clock_origins",
+        "clock": model.clocks[clock_index],
+        "clock_index": clock_index,
+        "event_index": event_index,
+        "event": events[event_index].event,
+        "regions_total": len(regions),
+        "entry_cells_pairwise_disjoint":
+            _entry_cells_pairwise_disjoint(list(groups.values())),
+        "origins": summaries,
+    }
+
+
+def _entry_cells_pairwise_disjoint(groups: list[list[_OriginRegion]]) -> bool:
+    """Exact DBM check across groups: the guard cells actually entered at the
+    selected event share no valuation at the same pre-event location.  Cells
+    within one (location, event) are disjoint by model validation; regions at
+    different pre-event locations are disjoint points of the state space."""
+    flats = [(gi, r) for gi, g in enumerate(groups) for r in g]
+    for a in range(len(flats)):
+        for b in range(a + 1, len(flats)):
+            gi, ra = flats[a]
+            gj, rb = flats[b]
+            if gi == gj:
+                continue
+            if ra.pre_location != rb.pre_location:
+                continue
+            if ra.entry_zone is not None and rb.entry_zone is not None \
+                    and ra.entry_zone.intersect(rb.entry_zone).is_satisfiable():
+                return False
+    return True
+
+
+def _render_origin_region(model: Model, r: _OriginRegion) -> dict[str, Any]:
+    trace = []
+    for ev_idx, ev_name, tid, reset_names in r.trace:
+        trace.append({
+            "event_index": ev_idx,
+            "event": ev_name,
+            "transition": tid,
+            "resets": list(reset_names),
+        })
+    return {
+        "pre_event_location": model.locations[r.pre_location],
+        "location": model.locations[r.location],
+        "pre_event_clock_value": r.pre_event_value,
+        "entry_cell_constraints":
+            r.entry_zone.to_constraints(model.clocks)
+            if r.entry_zone is not None else [],
+        "trace": trace,
+        "zone_constraints": r.zone.to_constraints(model.clocks),
+        "sample_clock_values": r.zone.assignment(model.clocks),
+    }
+
+
+# ---- reopen query admission -------------------------------------------------
+
+def origin_query(model: Model, events: list[EventWindow], verdict: dict[str, Any],
+                 clock_name: str, event_index: int) -> dict[str, Any]:
+    """Admit and answer a clock-origin reopen query against a stored verdict.
+
+    Refuses (OriginQueryError), without touching the stored frozen/rejected
+    conclusion, when:
+      * the clock is not declared on the model ("unknown_clock"),
+      * the chosen event was not processed, or lies beyond a rejected
+        verdict's first failure event ("event_not_processed" /
+        "event_beyond_first_failure"),
+      * the verdict has no traceable per-event region evidence
+        ("no_traceable_regions", e.g. an invalid-model record).
+    """
+    status = verdict.get("status")
+    if status not in ("frozen", "rejected") or not verdict.get("steps"):
+        raise OriginQueryError(
+            "no_traceable_regions",
+            "the stored verdict carries no traceable per-event region "
+            "evidence; the frozen/rejected conclusion is left unchanged")
+
+    if clock_name not in model.clocks:
+        raise OriginQueryError(
+            "unknown_clock",
+            f"clock {clock_name!r} is not declared on this model")
+
+    if not isinstance(event_index, int) or isinstance(event_index, bool):
+        raise OriginQueryError(
+            "event_not_processed", "event_index must be an integer")
+
+    if not 0 <= event_index < len(events):
+        raise OriginQueryError(
+            "event_not_processed",
+            f"event_index {event_index} is not a processed event "
+            f"(0..{len(events) - 1})")
+
+    if status == "rejected":
+        first_fail = verdict.get("earliest_event_index")
+        if not isinstance(first_fail, int) or event_index > first_fail:
+            raise OriginQueryError(
+                "event_beyond_first_failure",
+                "the queried event lies beyond this rejected verdict's first "
+                f"failure event[{first_fail}]; the rejection is reopened only "
+                "up to and including that event")
+
+    result = clock_origins(model, events, event_index,
+                           model.clocks.index(clock_name))
+    if result["regions_total"] == 0:
+        raise OriginQueryError(
+            "no_traceable_regions",
+            "no still-feasible region with traceable reset evidence reaches "
+            "this event; the original frozen/rejected conclusion is retained")
+    result["audit_id"] = model.audit_id
+    result["verdict_status"] = status
+    return result

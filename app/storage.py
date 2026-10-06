@@ -86,6 +86,10 @@ class Store:
                 "received_at": datetime.datetime.now(datetime.timezone.utc)
                 .isoformat(timespec="seconds"),
                 "model_valid": model_valid,
+                # Original submission kept for read-only reopen queries
+                # (clock-origin replays); verdict/evidence semantics above
+                # are unchanged.
+                "payload": payload,
                 "result": result,
             }
             self._data[audit_id] = record

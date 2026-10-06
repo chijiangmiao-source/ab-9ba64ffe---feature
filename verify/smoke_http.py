@@ -141,6 +141,69 @@ def main(base: str) -> int:
     s, b = call("GET", f"{base}/api/reviews/SMOKE-GAP")
     check("GET keeps original", s == 200 and b.get("status") == "rejected")
 
+    print("== reopen: clock origins split two equal-value resets ==")
+    # The failing cmd window [4,6] meets both disjoint guard cells; both
+    # transitions reset y to 0, yet the origins must stay separate.
+    s, b = call("GET", f"{base}/api/reviews/SMOKE-GAP/origins?clock=y&event=0")
+    check("origins 200", s == 200, f"status={s}")
+    origins = b.get("origins", [])
+    reset_src = [(o.get("origin"), o.get("reset_transition"),
+                  o.get("witness_after", {}).get("clock_value", {})
+                  .get("text"))
+                 for o in origins]
+    check("two distinct reset sources despite equal value 0",
+          reset_src == [("reset", "t_cooldown", "0"),
+                        ("reset", "t_open", "0")],
+          str(reset_src))
+    check("regions non-overlapping",
+          b.get("entry_cells_pairwise_disjoint") is True)
+    check("region counts sum",
+          sum(o.get("feasible_region_count", 0) for o in origins)
+          == b.get("regions_total"))
+    # stable grouping on repeated reopen
+    s2, b2 = call("GET", f"{base}/api/reviews/SMOKE-GAP/origins"
+                         "?clock=y&event=0")
+    check("stable origin grouping", b2 == b)
+
+    print("== reopen: forking reset vs never-reset path ==")
+    mix_model = json.loads(json.dumps(MODEL))
+    mix_model["audit_id"] = "SMOKE-MIX"
+    # open branch does not reset y: one region inherits from the initial
+    # instant, the other is reset by the cooling transition.
+    mix_model["transitions"][1]["resets"] = []
+    s, _ = call("POST", f"{base}/api/reviews",
+                {"model": mix_model,
+                 "events": [{"event": "cmd", "relative_lower": 0,
+                             "relative_upper": 8},
+                            {"event": "ack", "relative_lower": 2,
+                             "relative_upper": 2}]})
+    check("mix rejected 200", s == 200)
+    s, b = call("GET", f"{base}/api/reviews/SMOKE-MIX/origins"
+                       "?clock=y&event=0")
+    kinds = {o.get("origin"): o for o in b.get("origins", [])}
+    check("initial + reset sources kept",
+          set(kinds) == {"initial", "reset"}, str(set(kinds)))
+    check("reset source is cooling transition",
+          kinds.get("reset", {}).get("reset_transition") == "t_cooldown")
+    check("initial source straddles event with same witness",
+          kinds.get("initial", {}).get("witness_before", {})
+          .get("clock_value") == kinds.get("initial", {})
+          .get("witness_after", {}).get("clock_value"))
+
+    print("== reopen refusals leave the frozen/rejected verdict intact ==")
+    s, b = call("GET", f"{base}/api/reviews/SMOKE-GAP/origins"
+                       "?clock=nope&event=0")
+    check("unknown clock refused", s == 422 and
+          b.get("error", {}).get("code") == "unknown_clock")
+    s, b = call("GET", f"{base}/api/reviews/SMOKE-GAP/origins"
+                       "?clock=y&event=1")
+    check("past first failure refused", s == 422 and
+          b.get("error", {}).get("code") == "event_beyond_first_failure")
+    s, b = call("GET", f"{base}/api/reviews/SMOKE-GAP")
+    check("old rejection still readable after refusals",
+          s == 200 and b.get("status") == "rejected"
+          and b.get("earliest_event_index") == 0)
+
     if failures:
         print(f"\nSMOKE FAILURES: {failures}")
         return 1

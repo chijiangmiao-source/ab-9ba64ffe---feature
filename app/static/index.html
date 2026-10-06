@@ -60,6 +60,17 @@
   .fail { color:var(--bad); font-weight:600; }
   code { background:#0d1218; padding:1px 5px; border-radius:4px; }
   .pill { font-size:11px; color:var(--muted); margin-left:8px; }
+  .reopen { border:1px solid var(--line); border-radius:8px;
+            background:#0c1116; padding:12px 14px; margin:14px 0; }
+  .reopen select { margin-top:4px; }
+  .origin { border:1px solid var(--line); border-radius:8px;
+            background:var(--panel); padding:10px 14px; margin:8px 0; }
+  .origin h4 { margin:2px 0 6px; font-size:13px; }
+  .src-initial { border-left:3px solid var(--accent); }
+  .src-reset { border-left:3px solid var(--warn); }
+  .refused { border:1px solid var(--bad); background:#2a1414;
+             border-radius:8px; padding:10px 14px; margin:10px 0;
+             color:#ffb4b0; }
 </style>
 </head>
 <body>
@@ -117,6 +128,7 @@
 
   <section class="pane" id="resultPane">
     <p class="muted">提交后在此展示冻结结论、最早问题事件、可代入时钟取值、阻断守卫与逐事件区域证据。</p>
+    <div id="reopenPane"></div>
   </section>
 </main>
 
@@ -206,6 +218,7 @@ function zoneTable(zones){
 }
 
 function render(res){
+  LAST_RES = res;
   const status = res.status || "unknown";
   let html = `<div class="verdict ${esc(status)}">
     <h2><span class="tag ${esc(status)}">${esc(status.toUpperCase())}</span>
@@ -275,6 +288,92 @@ function render(res){
     html += `<details open><summary>最终区域</summary><div class="step-body">${zoneTable(res.final_states)}</div></details>`;
   }
   $("resultPane").innerHTML = html;
+  renderReopen(res);
+}
+
+// ---- frozen/rejected reopen: clock-origin (reset provenance) ----------------
+let LAST_RES = null;
+function processedEvents(res){
+  // events actually processed by the stored verdict; a rejection stops at
+  // its first failing event.
+  const out = [];
+  (res.steps||[]).forEach((s,i)=>out.push({i, name:s.event}));
+  return out;
+}
+function renderReopen(res){
+  const pane = $("reopenPane");
+  if(!res || !res.audit_id || (res.status!=="frozen" && res.status!=="rejected")
+     || !res.steps || !res.steps.length){ pane.innerHTML = ""; return; }
+  const clocks = splitList($("clkInput").value);
+  const evs = processedEvents(res);
+  const evOpts = evs.map(e=>`<option value="${e.i}">事件[${e.i}] · ${esc(e.name)}</option>`).join("");
+  pane.innerHTML = `
+    <div class="reopen">
+      <h3 style="margin:2px 0 6px;font-size:14px;">重开裁决 · 时钟来源（复位溯源）</h3>
+      <div class="muted" style="margin-bottom:8px">只读查询，不改动已冻结/已拒绝结论。按时钟最后一次复位的事件与迁移分组；相同展示值不会合并为同一冷却来源。</div>
+      <div class="row">
+        <div><label>时钟</label>
+          <select id="originClock">${clocks.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join("")}</select></div>
+        <div><label>已处理事件${res.status==="rejected"?"（不越过首个失败事件）":""}</label>
+          <select id="originEvent">${evOpts}</select></div>
+      </div>
+      <button id="originBtn" type="button">查询来源分组</button>
+      <div id="originResult" style="margin-top:10px"></div>
+    </div>`;
+  $("originBtn").onclick = queryOrigins;
+}
+
+async function queryOrigins(){
+  const res = $("originResult");
+  const auditId = (LAST_RES && LAST_RES.audit_id) || $("auditId").value.trim();
+  const clock = encodeURIComponent($("originClock").value);
+  const event = $("originEvent").value;
+  res.innerHTML = '<div class="muted">查询真实接口中…</div>';
+  let r, body;
+  try {
+    r = await fetch(`/api/reviews/${encodeURIComponent(auditId)}/origins?clock=${clock}&event=${event}`);
+    body = await r.json();
+  }catch(e){ res.innerHTML = `<div class="refused">查询失败：${esc(e.message)}</div>`; return; }
+  if(!r.ok || body.status!=="clock_origins"){
+    res.innerHTML = `<div class="refused"><b>查询被拒绝（${esc((body.error&&body.error.code)||body.status||"error")}）</b>
+      <div>${esc(body.reason||"")}</div><div class="muted">原冻结/拒绝结论未改动。</div></div>`;
+    return;
+  }
+  renderOrigins(body, res);
+}
+
+function renderOrigins(o, el){
+  let html = `<div class="muted">时钟 <code>${esc(o.clock)}</code> 在事件[${o.event_index}] <code>${esc(o.event)}</code>
+    的仍可行区域共 <b>${o.regions_total}</b> 个；进入单元两两不重叠：<b>${o.entry_cells_pairwise_disjoint?"是":"否"}</b>。</div>`;
+  if(!o.origins.length){
+    html += '<div class="refused">无任何带可追溯复位证据的可行区域。</div>';
+    el.innerHTML = html; return;
+  }
+  o.origins.forEach(g=>{
+    const reset = g.origin==="initial"
+      ? "<b>初始时刻继承</b>（全程未复位）"
+      : `由迁移 <code>${esc(g.reset_transition)}</code> 在事件[${g.reset_event_index}] <code>${esc(g.reset_event)}</code> 复位`;
+    html += `<div class="origin src-${g.origin}">
+      <h4>${reset} <span class="pill">覆盖可行区域 ${g.feasible_region_count} 个</span></h4>
+      <table><thead><tr><th>事件前可代入时钟见证</th><th>事件/复位后见证</th></tr></thead><tbody>
+        <tr><td>${frac(g.witness_before.clock_value)}<div class="muted">${esc(g.witness_before.point)} @事件[${g.witness_before.event_index}]</div></td>
+        <td>${frac(g.witness_after.clock_value)}<div class="muted">${esc(g.witness_after.point)} @事件[${g.witness_after.event_index}]</div></td></tr>
+      </tbody></table>`;
+    g.regions.forEach(rg=>{
+      html += `<details style="margin-top:6px"><summary>区域：${esc(rg.pre_event_location)} → <b>${esc(rg.location)}</b></summary>
+        <div class="step-body">
+          <div class="muted">触发轨迹：</div>
+          <div>${rg.trace.map(t=>`事件[${t.event_index}] <code>${esc(t.event)}</code> → <code>${esc(t.transition)}</code>${t.resets.length?` · 复位 {${t.resets.map(esc).join(",")}}`:""}`).join("<br>")||"（无）"}</div>
+          <div class="muted">事件前时钟 ${esc(o.clock)} = ${frac(rg.pre_event_clock_value)}</div>
+          <div class="muted">进入守卫单元（差分约束）：</div>
+          ${(rg.entry_cell_constraints||[]).map(c=>`<div>${esc(c.lhs)} ${c.op} ${frac(c.bound)}</div>`).join("")||'<div class="muted">无界</div>'}
+          <div class="muted">该来源区域可代入取值：</div>
+          <table><tbody>${clockValues(rg.sample_clock_values)}</tbody></table>
+        </div></details>`;
+    });
+    html += `</div>`;
+  });
+  el.innerHTML = html;
 }
 </script>
 </body>
