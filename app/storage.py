@@ -46,7 +46,8 @@ class Store:
             return json.loads(json.dumps(rec)) if rec else None
 
     def submit(self, audit_id: str, payload: Any, result: dict[str, Any],
-               model_valid: bool) -> dict[str, Any]:
+               model_valid: bool, lineage_trace: Any = None
+               ) -> dict[str, Any]:
         """Persist or reconcile a submission.
 
         Returns the response body including replay/conflict annotations.
@@ -87,6 +88,7 @@ class Store:
                 .isoformat(timespec="seconds"),
                 "model_valid": model_valid,
                 "result": result,
+                "lineage_trace": lineage_trace,
             }
             self._data[audit_id] = record
             self._flush()

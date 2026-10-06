@@ -35,7 +35,7 @@ app/engine.py    精确区域复核引擎（模型解析、校验、区域传播
 app/storage.py   审计标识证据留存（规范化指纹、重放、冲突）
 app/main.py      FastAPI：/api/reviews、/api/reviews/{id}、/health、页面
 app/static/      复核页面（结论 + 逐事件区域证据）
-tests/           31 项规则/API/差分不变量测试
+tests/           47 项规则/API/来源/差分不变量测试
 verify/          verify 容器入口脚本与 HTTP 冒烟
 Dockerfile, docker-compose.yml
 ```
@@ -127,3 +127,38 @@ verify/run_tests.sh                      # 与 verify 容器相同的三步流�
 - 语义等价重传在原结论中附 `replay.semantically_equivalent_retransmission=true`。
 
 `GET /api/reviews/{audit_id}` 取回留存的原始结论与证据。
+
+## 重开裁决 · 时钟来源（最后复位）复核
+
+审查员可重开一份**已冻结或被拒绝**的裁决，对某个**已处理事件**与一个
+时钟，查清该时钟在每条仍可行轨迹上究竟**继承自初始时刻**，还是由**哪一次
+具体迁移复位**——即使两条轨迹上时钟的展示值相同（例如都是 0），也按来源
+分别保留，绝不按值合并。
+
+- `GET /api/reviews/{audit_id}/lineage`：不带参数，返回可选时钟列表、可查
+  的**已处理事件**及其仍可行区域数（选择元数据，来自真实留存记录）。
+- `GET /api/reviews/{audit_id}/lineage?clock={c}&event={k}`：返回按来源划分
+  的**不重叠区域摘要**，每项包含：
+  - `source_category`：`initial`（未复位，继承自 0 时刻）或 `reset`；
+  - 复位所在事件 `reset_event_index`/`reset_event` 与迁移
+    `reset_transition`；
+  - 该事件**前/后可代入的精确有理数时钟见证**
+    （`witness_before_event`/`witness_after_event`）；
+  - `feasible_region_count`：该来源覆盖的仍可行区域数量，以及区域 id、位置、
+    迁移序列与逐区域 DBM 证据。
+
+来源标记与既有区域切分、迁移执行、复位在**同一次传播**中同步推进（窗口推进
+→ 守卫切分 → 唯一迁移 → 复位）。被拒绝裁决的首个失败事件上，守卫缺口两侧
+仍被覆盖的可行分片各自携带自己的复位来源。
+
+查询为**只读**，原冻结/拒绝结论永不改变；以下情况明确拒绝（`422`，
+`status:"lineage_query_rejected"`）：
+
+- 选择了模型中不存在的时钟（`unknown_clock`）；
+- 查询越过被拒绝裁决的**首个失败事件**（事件未被处理，
+  `event_beyond_processed_prefix`）；
+- 读取缺少可追溯区域证据的历史记录（`missing_lineage_trace`）；
+- 未知审计标识返回 `404`。
+
+审计详情、提交、语义等价重传与同标识冲突语义保持不变。
+

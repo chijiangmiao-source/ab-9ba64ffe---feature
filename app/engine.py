@@ -891,3 +891,366 @@ def _reason_text(f: dict[str, Any]) -> str:
         return ("after the final event a possible trajectory rests in "
                 f"non-final location {f.get('location')!r}")
     return f"event[{idx}]: review failed"
+
+
+# ---- clock provenance (lineage) ---------------------------------------------
+#
+# When a frozen/rejected capture is reopened the reviewer must, for a chosen
+# clock at one already-processed event, state for every still-feasible region
+# whether the clock value is inherited from time zero ("initial") or was last
+# reset by a concrete transition firing.  Labels ride along with the *same*
+# propagation used for the verdict (window elapse -> guard split -> unique
+# transition -> reset), so provenance never drifts from the zone evidence.
+#
+# At a passing event each convex region enables exactly one transition (two
+# disjoint closed boxes cannot cover a convex zone without the open slab
+# between them).  At the failing event of a rejected capture the covered
+# pieces on both sides of the gap are still-feasible regions: each piece
+# fired its own transition and may have reset the queried clock differently,
+# which is exactly the forking reset / no-reset situation the lineage must
+# keep apart -- even when both branches display the same value (0).
+
+
+class LineageQueryError(ValueError):
+    """A reopen/lineage query cannot be answered from the stored evidence."""
+
+    def __init__(self, message: str, details: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.details = details or {}
+
+
+@dataclass(frozen=True)
+class ClockSource:
+    """Last-reset provenance of one clock on one symbolic trajectory."""
+    category: str  # "initial" | "reset"
+    event_index: int | None = None
+    event: str | None = None
+    transition: str | None = None
+
+    def as_json(self) -> dict[str, Any]:
+        out = {"category": self.category}
+        if self.category == "reset":
+            out.update({"event_index": self.event_index,
+                        "event": self.event,
+                        "transition": self.transition})
+        return out
+
+    def key(self) -> tuple:
+        if self.category == "initial":
+            return ("initial",)
+        return ("reset", self.event_index, self.transition or "")
+
+
+@dataclass
+class _PState:
+    location: int
+    zone: Zone
+    labels: tuple[ClockSource, ...]
+    paths: tuple[tuple[str, ...], ...]
+    region_id: str
+
+
+def _zone_key(z: Zone) -> tuple:
+    return z.signature()
+
+
+def build_lineage_trace(model: Model, events: list[EventWindow],
+                        verdict: dict[str, Any]) -> dict[str, Any]:
+    """Re-run propagation carrying per-clock last-reset labels.
+
+    Mirrors ``review`` exactly; the trace stops at (and includes) the first
+    failing event of a rejected capture.  At a coverage failure the covered,
+    still-feasible guard pieces on either side of the gap are recorded as
+    regions (with their own resets); at a no-transition failure the event
+    simply has zero regions.
+    """
+    status = verdict.get("status")
+    if status == "frozen":
+        last_index = len(events) - 1
+        terminal_outcome = "frozen"
+        failure_kind = None
+    else:
+        last_index = int(verdict["earliest_event_index"])
+        failure_kind = (verdict.get("failure") or {}).get("kind")
+        terminal_outcome = failure_kind or "rejected"
+
+    n = model.n
+    initial_labels = tuple(ClockSource("initial") for _ in range(n))
+    states: list[_PState] = [_PState(
+        model.initial, Zone.initial(n), initial_labels, ((),), "init")]
+
+    trace_events: list[dict[str, Any]] = []
+
+    for w in events[:last_index + 1]:
+        idx = w.raw_index
+        advanced = [_PState(st.location,
+                            st.zone.restrict_elapse_window(w.lo, w.hi),
+                            st.labels, st.paths, st.region_id)
+                    for st in states]
+
+        by_loc: dict[int, list[Transition]] = {}
+        for t in model.transitions:
+            if t.event == w.event:
+                by_loc.setdefault(t.source, []).append(t)
+
+        # key -> merged region accumulator
+        merged: dict[tuple, dict[str, Any]] = {}
+        for st in advanced:
+            candidates = by_loc.get(st.location, [])
+            for t in candidates:
+                gz = st.zone.intersect(t.guard_zone(n))
+                gz.canonicalize()
+                if not gz.is_satisfiable():
+                    continue
+                post = gz.reset(c + 1 for c in t.resets)
+                post.canonicalize()
+                new_labels = tuple(
+                    ClockSource("reset", idx, w.event, t.id)
+                    if c in t.resets else st.labels[c]
+                    for c in range(n))
+                key = (t.target, _zone_key(post), new_labels)
+                contributor = {
+                    "transition": t.id,
+                    "source_location": model.locations[t.source],
+                    "guard_zone": gz.to_constraints(model.clocks),
+                    "witness_before": gz.assignment(model.clocks),
+                    "parent_region_id": st.region_id,
+                    "paths": [list(p + (t.id,)) for p in st.paths],
+                }
+                if key in merged:
+                    seen = merged[key]["_contrib_keys"]
+                    ck = (t.id, st.region_id,
+                          tuple(tuple(p) for p in contributor["paths"]),
+                          tuple((c["lhs"], c["op"],
+                                 c["bound"]["text"])
+                                for c in contributor["guard_zone"]))
+                    if ck not in seen:
+                        seen.add(ck)
+                        merged[key]["contributors"].append(contributor)
+                else:
+                    merged[key] = {
+                        "location": t.target,
+                        "zone": post,
+                        "clock_sources": new_labels,
+                        "post_reset_zone": post.to_constraints(model.clocks),
+                        "witness_after": post.assignment(model.clocks),
+                        "contributors": [contributor],
+                        "_contrib_keys": {
+                            (t.id, st.region_id,
+                             tuple(tuple(p) for p in contributor["paths"]),
+                             tuple((c["lhs"], c["op"], c["bound"]["text"])
+                                   for c in contributor["guard_zone"]))},
+                    }
+
+        ordered = sorted(
+            merged.values(),
+            key=lambda r: (r["location"],
+                           r["contributors"][0]["transition"],
+                           tuple((c["lhs"], c["op"], c["bound"]["text"])
+                                 for c in r["post_reset_zone"])))
+
+        regions: list[dict[str, Any]] = []
+        next_states: list[_PState] = []
+        for rnum, r in enumerate(ordered):
+            rid = f"e{idx}-r{rnum}"
+            paths: set[tuple[str, ...]] = set()
+            for contrib in r["contributors"]:
+                for p in contrib["paths"]:
+                    paths.add(tuple(p))
+            region = {
+                "region_id": rid,
+                "location": model.locations[r["location"]],
+                "clock_sources": {
+                    model.clocks[c]: r["clock_sources"][c].as_json()
+                    for c in range(n)},
+                "post_reset_zone": r["post_reset_zone"],
+                "witness_after": r["witness_after"],
+                "paths": [list(p) for p in sorted(paths)],
+                "contributors": [{
+                    "transition": c["transition"],
+                    "source_location": c["source_location"],
+                    "guard_zone": c["guard_zone"],
+                    "witness_before": c["witness_before"],
+                    "parent_region_id": c["parent_region_id"],
+                } for c in r["contributors"]],
+            }
+            regions.append(region)
+            next_states.append(_PState(
+                r["location"], r["zone"], r["clock_sources"],
+                tuple(sorted(paths)), rid))
+
+        if idx == last_index and failure_kind in ("uncovered_time",
+                                                  "no_transition"):
+            outcome = failure_kind
+        else:
+            outcome = "propagated"
+        trace_events.append({
+            "event_index": idx,
+            "event": w.event,
+            "outcome": outcome,
+            "regions": regions,
+        })
+        states = next_states
+
+    return {
+        "clocks": list(model.clocks),
+        "events": [{"event_index": e["event_index"], "event": e["event"],
+                    "outcome": e["outcome"],
+                    "region_count": len(e["regions"])}
+                   for e in trace_events],
+        "initial": {
+            "region_id": "init",
+            "location": model.locations[model.initial],
+            "clock_sources": {c: {"category": "initial"}
+                              for c in model.clocks},
+            "witness": {c: frac_out(Fraction(0)) for c in model.clocks},
+        },
+        "terminal_outcome": terminal_outcome,
+        "event_regions": trace_events,
+    }
+
+
+def lineage_summary(trace: dict[str, Any], clock_name: str,
+                    event_index: Any) -> dict[str, Any]:
+    """Partition still-feasible regions of one event by a clock's last reset.
+
+    Raises LineageQueryError for an unknown clock, an event beyond the
+    processed prefix (i.e. at/past nothing -- events past the first failure
+    of a rejected verdict are refused), or evidence lacking a lineage trace.
+    The summary never mutates the stored verdict.
+
+    With ``event_index is None`` the trace's selectable clocks and processed
+    events are returned instead (used by the reopen page to offer choices).
+    """
+    if not isinstance(trace, dict) or "event_regions" not in trace:
+        raise LineageQueryError(
+            "this historical record carries no traceable zone evidence; "
+            "the original frozen/rejected conclusion is retained unchanged",
+            {"code": "missing_lineage_trace"})
+
+    clocks = trace.get("clocks", [])
+
+    if event_index is None:
+        return {
+            "status": "select",
+            "clocks": list(clocks),
+            "terminal_outcome": trace.get("terminal_outcome"),
+            "processed_events": [
+                {"event_index": e["event_index"], "event": e["event"],
+                 "outcome": e["outcome"],
+                 "region_count": len(e["regions"])}
+                for e in trace.get("event_regions", [])],
+            "initial": trace.get("initial"),
+        }
+
+    if not isinstance(clock_name, str) or clock_name not in clocks:
+        raise LineageQueryError(
+            f"unknown clock {clock_name!r}; declared clocks: {clocks}",
+            {"code": "unknown_clock", "declared_clocks": clocks})
+
+    try:
+        k = int(event_index)
+    except (TypeError, ValueError):
+        raise LineageQueryError(
+            f"event index must be an integer, got {event_index!r}",
+            {"code": "bad_event_index"})
+    if str(k) != str(event_index).strip():
+        raise LineageQueryError(
+            f"event index must be an integer, got {event_index!r}",
+            {"code": "bad_event_index"})
+
+    regions_by_event = {e["event_index"]: e
+                        for e in trace.get("event_regions", [])}
+    if k not in regions_by_event:
+        processed = [e["event_index"]
+                     for e in trace.get("event_regions", [])]
+        raise LineageQueryError(
+            f"event[{k}] is not part of the traceable processed prefix "
+            f"(processed event indices: {processed}); queries past the "
+            "first failing event of a rejected verdict are refused",
+            {"code": "event_beyond_processed_prefix",
+             "processed_event_indices": processed,
+             "terminal_outcome": trace.get("terminal_outcome")})
+
+    evrec = regions_by_event[k]
+    groups: dict[tuple, dict[str, Any]] = {}
+    for region in evrec["regions"]:
+        src = region["clock_sources"][clock_name]
+        if src["category"] == "initial":
+            gkey = ("initial", None, None)
+        else:
+            gkey = ("reset", src["event_index"], src["transition"])
+        contrib0 = region["contributors"][0]
+        entry = {
+            "region_id": region["region_id"],
+            "location": region["location"],
+            "fired_transition": contrib0["transition"],
+            "witness_before_event": contrib0["witness_before"].get(
+                clock_name),
+            "witness_after_event": region["witness_after"].get(clock_name),
+            "paths": region["paths"],
+            "guard_zone": contrib0["guard_zone"],
+            "post_reset_zone": region["post_reset_zone"],
+        }
+        if gkey in groups:
+            groups[gkey]["region_entries"].append(entry)
+        else:
+            groups[gkey] = {"source_key": gkey, "region_entries": [entry]}
+
+    def sort_key(item: tuple[tuple, dict[str, Any]]) -> tuple:
+        gkey = item[0]
+        if gkey[0] == "initial":
+            return (0, 0, "")
+        return (1, gkey[1] if gkey[1] is not None else 0, gkey[2] or "")
+
+    summary: list[dict[str, Any]] = []
+    for gkey, g in sorted(groups.items(), key=sort_key):
+        entries = g["region_entries"]
+        category, reset_event_index, reset_transition = gkey
+        reset_event_name = None
+        if category == "reset":
+            for e in trace.get("event_regions", []):
+                if e["event_index"] == reset_event_index:
+                    reset_event_name = e["event"]
+                    break
+        # representative witnesses: deterministic (smallest region id)
+        rep = sorted(entries, key=lambda r: r["region_id"])[0]
+        summary.append({
+            "source_category": category,
+            "reset_event_index": reset_event_index,
+            "reset_event": reset_event_name,
+            "reset_transition": reset_transition,
+            "witness_before_event": {
+                clock_name: rep["witness_before_event"]},
+            "witness_after_event": {
+                clock_name: rep["witness_after_event"]},
+            "feasible_region_count": len(entries),
+            "region_ids": [r["region_id"] for r in entries],
+            "locations": sorted({r["location"] for r in entries}),
+            "paths": sorted({tuple(p)
+                             for r in entries for p in r["paths"]}),
+            "traceable_zone_evidence": [{
+                "region_id": r["region_id"],
+                "location": r["location"],
+                "fired_transition": r["fired_transition"],
+                "witness_before_event": {
+                    clock_name: r["witness_before_event"]},
+                "witness_after_event": {
+                    clock_name: r["witness_after_event"]},
+                "guard_zone": r["guard_zone"],
+                "post_reset_zone": r["post_reset_zone"],
+            } for r in sorted(entries, key=lambda r: r["region_id"])],
+        })
+        # tuples are JSON-hostile; normalise paths now
+        summary[-1]["paths"] = [list(p) for p in summary[-1]["paths"]]
+
+    return {
+        "status": "ok",
+        "clock": clock_name,
+        "event_index": k,
+        "event": evrec["event"],
+        "event_outcome": evrec["outcome"],
+        "terminal_outcome": trace.get("terminal_outcome"),
+        "regions_total": len(evrec["regions"]),
+        "summary": summary,
+    }

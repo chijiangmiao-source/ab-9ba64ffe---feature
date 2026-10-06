@@ -141,6 +141,75 @@ def main(base: str) -> int:
     s, b = call("GET", f"{base}/api/reviews/SMOKE-GAP")
     check("GET keeps original", s == 200 and b.get("status") == "rejected")
 
+    print("== reopen: forking reset vs never-reset provenance ==")
+    fork_model = {
+        "audit_id": "SMOKE-LINE",
+        "locations": ["armed", "A", "B", "done"],
+        "clocks": ["x", "y"],
+        "initial_location": "armed",
+        "final_locations": ["done"],
+        "transitions": [
+            {"id": "toA", "source": "armed", "target": "A", "event": "cmd",
+             "guards": [{"clock": "x", "lower": 0, "upper": 4}],
+             "resets": ["y"]},
+            {"id": "toB", "source": "armed", "target": "B", "event": "cmd",
+             "guards": [{"clock": "x", "lower": 5, "upper": 10}],
+             "resets": []},
+        ],
+    }
+    fork_events = [
+        {"event": "cmd", "relative_lower": 2, "relative_upper": 8},
+        {"event": "ack", "relative_lower": 1, "relative_upper": 1}]
+    s, b = call("POST", f"{base}/api/reviews",
+                {"model": fork_model, "events": fork_events})
+    check("fork rejected", s == 200 and b.get("status") == "rejected")
+
+    s, sel = call("GET", f"{base}/api/reviews/SMOKE-LINE/lineage")
+    check("lineage choices 200", s == 200 and sel.get("status") == "select")
+    check("lineage clocks listed", sel.get("clocks") == ["x", "y"],
+          str(sel.get("clocks")))
+    check("lineage only processed prefix",
+          [e["event_index"] for e in sel.get("processed_events", [])] == [0])
+
+    s, ln = call("GET",
+                 f"{base}/api/reviews/SMOKE-LINE/lineage?clock=y&event=0")
+    groups = ln.get("summary", []) if s == 200 else []
+    cats = {g.get("source_category") for g in groups}
+    check("lineage 200", s == 200, str(s))
+    check("two disjoint source groups", cats == {"initial", "reset"},
+          str(cats))
+    check("two regions partitioned",
+          ln.get("regions_total") == 2
+          and sum(g.get("feasible_region_count", 0) for g in groups) == 2)
+    reset_g = next((g for g in groups
+                    if g.get("source_category") == "reset"), {})
+    check("reset names event+transition",
+          reset_g.get("reset_event_index") == 0
+          and reset_g.get("reset_transition") == "toA")
+    check("rational witnesses present",
+          bool(reset_g.get("witness_before_event", {}).get("y", {})
+               .get("text"))
+          and reset_g.get("witness_after_event", {}).get("y", {})
+          .get("text") == "0")
+
+    s, bad_clk = call("GET",
+                      f"{base}/api/reviews/SMOKE-LINE/lineage?clock=zz&event=0")
+    check("unknown clock refused",
+          s == 422 and bad_clk.get("error", {}).get("details", {})
+          .get("code") == "unknown_clock")
+    s, bad_ev = call("GET",
+                     f"{base}/api/reviews/SMOKE-LINE/lineage?clock=y&event=1")
+    check("event past first failure refused",
+          s == 422 and bad_ev.get("error", {}).get("details", {})
+          .get("code") == "event_beyond_processed_prefix")
+    s, still = call("GET", f"{base}/api/reviews/SMOKE-LINE")
+    check("frozen conclusion unchanged after refused queries",
+          s == 200 and still.get("status") == "rejected"
+          and still.get("earliest_event_index") == 0)
+    s, nf = call("GET", f"{base}/api/reviews/NO-SUCH/lineage?clock=x&event=0")
+    check("lineage of missing record 404",
+          s == 404 and nf.get("status") == "not_found")
+
     if failures:
         print(f"\nSMOKE FAILURES: {failures}")
         return 1

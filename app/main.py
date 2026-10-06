@@ -9,7 +9,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .engine import ModelError, parse_capture, parse_model, review
+from .engine import (LineageQueryError, build_lineage_trace, lineage_summary,
+                     ModelError, parse_capture, parse_model, review)
 from .storage import Store
 
 STORE_PATH = os.environ.get("EVIDENCE_STORE", "/data/evidence.json")
@@ -71,7 +72,14 @@ def _run(payload: Any) -> tuple[dict[str, Any], int]:
         return body, 422
 
     result = review(model, events)
-    stored = store.submit(model.audit_id, payload, result, model_valid=True)
+    # Provenance trace rides the same propagation; it is stored alongside the
+    # verdict but is never part of the original frozen/rejected conclusion.
+    try:
+        trace = build_lineage_trace(model, events, result)
+    except Exception:  # lineage is evidence-only; never alters the verdict
+        trace = None
+    stored = store.submit(model.audit_id, payload, result, model_valid=True,
+                          lineage_trace=trace)
     code = 409 if stored.get("status") == "conflict" else 200
     return stored, code
 
@@ -104,6 +112,36 @@ def get_review(audit_id: str) -> JSONResponse:
     body = dict(rec["result"])
     body["fingerprint"] = rec["fingerprint"]
     body["received_at"] = rec["received_at"]
+    return JSONResponse(body)
+
+
+@app.get("/api/reviews/{audit_id}/lineage")
+def get_lineage(audit_id: str, clock: str = "",
+                event: int | str | None = None) -> JSONResponse:
+    """Read-only clock-provenance summary for a frozen/rejected capture.
+
+    The stored verdict is never mutated: this endpoint recomputes nothing
+    beyond partitioning the traceable zone evidence already retained.
+    """
+    rec = store.lookup(audit_id)
+    if rec is None:
+        return JSONResponse({"status": "not_found",
+                             "audit_id": audit_id}, status_code=404)
+    trace = rec.get("lineage_trace")
+    try:
+        body = lineage_summary(trace, clock, event)
+    except LineageQueryError as exc:
+        return JSONResponse({
+            "status": "lineage_query_rejected",
+            "audit_id": audit_id,
+            "verdict_status": rec["result"].get("status"),
+            "reason": str(exc),
+            "error": {"code": exc.details.get("code", "bad_lineage_query"),
+                      "message": str(exc),
+                      "details": exc.details},
+        }, status_code=422)
+    body["audit_id"] = audit_id
+    body["verdict_status"] = rec["result"].get("status")
     return JSONResponse(body)
 
 

@@ -113,10 +113,37 @@
       <button id="replayBtn" class="secondary" type="button">同标识重放</button>
       <button id="conflictBtn" class="secondary" type="button">同标识改内容</button>
     </div>
+
+    <h3 style="margin:22px 0 4px;font-size:14px;">重开裁决 · 时钟来源（最后复位）复核</h3>
+    <div class="limits">对已冻结/被拒绝的裁决，选择一个已处理事件与时钟，按来源划分仍可行区域；来源不会按展示值合并。</div>
+    <div class="row">
+      <div style="flex:2">
+        <label>审计标识</label>
+        <input id="reopenId" value="ISO-DEMO-0001"/>
+      </div>
+      <div style="flex:1">
+        <label>&nbsp;</label>
+        <button id="reopenLoad" class="secondary" type="button"
+          style="margin-top:0;width:100%;">载入裁决</button>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>已处理事件</label>
+        <select id="reopenEvent"></select>
+      </div>
+      <div>
+        <label>时钟</label>
+        <select id="reopenClock"></select>
+      </div>
+    </div>
+    <button id="reopenQuery" type="button"
+      style="background:#2ea043;color:#fff;">查询时钟来源分组</button>
   </section>
 
   <section class="pane" id="resultPane">
     <p class="muted">提交后在此展示冻结结论、最早问题事件、可代入时钟取值、阻断守卫与逐事件区域证据。</p>
+    <div id="lineagePane"></div>
   </section>
 </main>
 
@@ -274,7 +301,88 @@ function render(res){
   if(res.final_states){
     html += `<details open><summary>最终区域</summary><div class="step-body">${zoneTable(res.final_states)}</div></details>`;
   }
-  $("resultPane").innerHTML = html;
+  $("resultPane").innerHTML = html + '<div id="lineagePane"></div>';
+  if(res.audit_id){ $("reopenId").value = res.audit_id; }
+}
+
+// ---- reopen: clock provenance (last-reset source) ---------------------------
+async function apiGet(url){
+  const r = await fetch(url);
+  return { status: r.status, body: await r.json() };
+}
+function lineageError(title, msg, details){
+  $("lineagePane").innerHTML =
+   `<div class="verdict invalid_model"><h2>${esc(title)}</h2>
+    <div>${esc(msg||"")}</div>
+    ${details?`<div class="evidence-box" style="white-space:pre-wrap">${esc(JSON.stringify(details,null,1))}</div>`:""}
+    <div class="muted">原冻结/拒绝结论保持不变。</div></div>`;
+}
+$("reopenLoad").onclick = async ()=>{
+  const id = encodeURIComponent($("reopenId").value.trim());
+  if(!id){ lineageError("无法载入","审计标识为空"); return; }
+  const {status, body} = await apiGet(`/api/reviews/${id}/lineage`);
+  if(status === 404){ lineageError("裁决不存在", body.reason || "未找到该审计标识"); return; }
+  if(status !== 200 || body.status !== "select"){
+    lineageError("该历史记录缺少可追溯区域证据", body.reason, body.error&&body.error.details);
+    return;
+  }
+  const evSel = $("reopenEvent"), clkSel = $("reopenClock");
+  evSel.innerHTML = (body.processed_events||[]).map(e=>
+    `<option value="${e.event_index}">事件[${e.event_index}] ${esc(e.event)}`+
+    ` · ${e.region_count} 个可行区域${e.outcome!=="propagated"?` · ${esc(e.outcome)}`:""}</option>`).join("");
+  clkSel.innerHTML = (body.clocks||[]).map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join("");
+  $("lineagePane").innerHTML =
+   `<div class="evidence-box">已载入 <b>${esc(id)}</b>（${esc(body.terminal_outcome)}）：`+
+   `可选时钟 ${(body.clocks||[]).map(esc).join(", ")}；请选择事件与时钟后查询。</div>`;
+};
+$("reopenQuery").onclick = async ()=>{
+  const id = encodeURIComponent($("reopenId").value.trim());
+  const ev = $("reopenEvent").value, clk = $("reopenClock").value;
+  if(!id){ lineageError("无法查询","审计标识为空"); return; }
+  if(ev===""||!clk){ lineageError("无法查询","请先载入裁决并选择事件与时钟"); return; }
+  const {status, body} = await apiGet(
+    `/api/reviews/${id}/lineage?clock=${encodeURIComponent(clk)}&event=${encodeURIComponent(ev)}`);
+  if(status !== 200){
+    lineageError("查询被拒绝", body.reason, body.error&&body.error.details);
+    return;
+  }
+  renderLineage(body);
+};
+function renderLineage(res){
+  const rows = res.summary.map((g,i)=>{
+    const src = g.source_category==="initial"
+      ? `<b>初始时刻（未复位）</b>`
+      : `<b>复位</b>：事件[${g.reset_event_index}] <code>${esc(g.reset_event)}</code>`+
+        ` · 迁移 <code>${esc(g.reset_transition)}</code>`;
+    return `<tr>
+      <td>${i+1}</td>
+      <td><span class="tag ${g.source_category==="initial"?"invalid_model":"frozen"}">${esc(g.source_category)}</span><br>${src}</td>
+      <td>${frac(g.witness_before_event[res.clock])}</td>
+      <td>${frac(g.witness_after_event[res.clock])}</td>
+      <td>${g.feasible_region_count}</td>
+      <td>${(g.locations||[]).map(esc).join("<br>")}<div class="muted">${(g.region_ids||[]).map(esc).join(", ")}</div></td>
+    </tr>`;
+  }).join("");
+  const total = res.summary.reduce((a,g)=>a+g.feasible_region_count,0);
+  $("lineagePane").innerHTML = `
+    <h3>时钟来源分组 · <code>${esc(res.clock)}</code> @ 事件[${res.event_index}] <code>${esc(res.event)}</code></h3>
+    <div class="evidence-box">裁决 <b>${esc(res.audit_id)}</b>（${esc(res.verdict_status)}）·
+      事件结局 ${esc(res.event_outcome)} · 仍可行区域 ${res.regions_total} 个，
+      分为 ${res.summary.length} 个互不重叠来源组（合计覆盖 ${total}）。
+      相同展示值但来源不同时分别保留，不按值合并。</div>
+    <table><thead><tr>
+      <th>#</th><th>来源类别（复位所在事件/迁移）</th>
+      <th>事件前可代入时钟见证</th><th>事件后可代入时钟见证</th>
+      <th>覆盖可行区域数</th><th>位置 / 区域</th>
+    </tr></thead><tbody>${rows}</tbody></table>
+    <details><summary>逐区域可追溯区域证据</summary><div class="step-body">` +
+    res.summary.map(g=>g.traceable_zone_evidence.map(z=>`
+      <div class="evidence-box">
+        <div><b>${esc(z.region_id)}</b> · ${esc(z.location)} · 迁移 <code>${esc(z.fired_transition)}</code></div>
+        <div>事件前 ${esc(res.clock)} = ${frac(z.witness_before_event[res.clock])}；
+             事件后 ${esc(res.clock)} = ${frac(z.witness_after_event[res.clock])}</div>
+      </div>`).join("")).join("") +
+    `</div></details>`;
 }
 </script>
 </body>
